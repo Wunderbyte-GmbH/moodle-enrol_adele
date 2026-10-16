@@ -231,7 +231,7 @@ class reconciler {
         // management page reads this back instead. Stored as plugin config
         // rather than in a table of its own, because a single last-run
         // summary does not justify a schema.
-        set_config('lastreport', json_encode($report + ['timestamp' => time()]), 'enrol_adele');
+        set_config('lastreport', json_encode($report + ['timestamp' => \core\di::get(\core\clock::class)->time()]), 'enrol_adele');
 
         if ($trace) {
             $trace->output(
@@ -447,6 +447,105 @@ class reconciler {
     }
 
     /**
+     * Remove one subscription now, if no embedding carries the user any more.
+     *
+     * The one place that decides and does it, for both callers:
+     * remove_user_path_adhoc after its delay, and
+     * withdraw_uncarried_subscriptions() when a teacher saves an activity.
+     * The record is the only copy of the learner's history, so it goes only
+     * on a definite "not carried"; the enrolments it justified go with it.
+     *
+     * @param int $learningpathid The learning path id.
+     * @param int $userid The user id.
+     * @return bool Whether the subscription was removed.
+     */
+    public static function remove_uncarried_user(int $learningpathid, int $userid): bool {
+        global $DB;
+
+        if (\enrol_adele\observer::is_user_carried($learningpathid, $userid)) {
+            return false;
+        }
+        $DB->delete_records(
+            'local_adele_path_user',
+            ['learning_path_id' => $learningpathid, 'user_id' => $userid]
+        );
+        self::purge_user($learningpathid, $userid);
+        self::purge_all_host_user($learningpathid, $userid);
+        return true;
+    }
+
+    /**
+     * A teacher changed or removed an embedding: withdraw at once every
+     * subscription to this path that no embedding carries any more.
+     *
+     * Decision of 2026-10-13: removing a participant source (or moving an
+     * activity to another path) takes effect when the form is saved, not
+     * after the nightly sweep and its delay. The delay of
+     * remove_user_path_adhoc exists for enrolment EVENTS - a resync or bulk
+     * import that drops a membership for seconds and cannot be told from a
+     * departure. A saved setting is no blip: it is the teacher's decision,
+     * and the delay would only keep access open that nobody justifies.
+     *
+     * Same guard as the delayed removal: when mod_adele cannot be asked,
+     * "not carried" cannot be told from "cannot tell", so nothing is removed.
+     *
+     * @param int $learningpathid The learning path id.
+     * @return int Number of subscriptions removed.
+     */
+    public static function withdraw_uncarried_subscriptions(int $learningpathid): int {
+        global $DB;
+
+        if (!self::is_active() || !self::host_policy_reachable()) {
+            return 0;
+        }
+        $userids = $DB->get_fieldset_select(
+            'local_adele_path_user',
+            'user_id',
+            "learning_path_id = :lpid AND status = 'active'",
+            ['lpid' => $learningpathid]
+        );
+        $removed = 0;
+        foreach (array_unique(array_map('intval', $userids)) as $userid) {
+            if (self::remove_uncarried_user($learningpathid, $userid)) {
+                $removed++;
+            }
+        }
+        return $removed;
+    }
+
+    /**
+     * Remove the host enrolment method of a path from a course that no longer
+     * has an embedding needing it (sources "starting node" / "any course").
+     *
+     * Decision of 2026-10-15, "deleted is (cleanly) gone": once the last such
+     * embedding is deleted or narrowed to "this course", the method would
+     * stay behind empty or with suspended rows nobody can explain. Removing
+     * the instance removes those rows with it. Same guard as everywhere:
+     * when mod_adele cannot be asked, nothing is removed.
+     *
+     * @param int $learningpathid The learning path id.
+     * @param int $courseid The course.
+     * @return bool Whether an instance was removed.
+     */
+    public static function remove_unused_host_instance(int $learningpathid, int $courseid): bool {
+        if (!self::is_active() || !self::host_policy_reachable()) {
+            return false;
+        }
+        foreach (\local_adele\enrol_state::get_host_embeddings($learningpathid) as $embedding) {
+            if ((int) $embedding['courseid'] === $courseid && ($embedding['option2'] || $embedding['option3'])) {
+                return false;
+            }
+        }
+        $instance = instance_manager::get_instances($learningpathid, instance_manager::KIND_HOST)[$courseid] ?? null;
+        $plugin = enrol_get_plugin('adele');
+        if (!$instance || !$plugin) {
+            return false;
+        }
+        $plugin->delete_instance($instance);
+        return true;
+    }
+
+    /**
      * Pass 7 — subscriptions that no embedding carries any more.
      *
      * The missing subtraction path. Everything else in this class starts from
@@ -511,7 +610,9 @@ class reconciler {
 
             $task = new \enrol_adele\task\remove_user_path_adhoc();
             $task->set_custom_data(['learningpathid' => $lpid, 'userid' => $userid]);
-            $task->set_next_run_time(time() + \enrol_adele\task\remove_user_path_adhoc::DELAY_SECONDS);
+            $runat = \core\di::get(\core\clock::class)->time()
+                + \enrol_adele\task\remove_user_path_adhoc::DELAY_SECONDS;
+            $task->set_next_run_time($runat);
             \core\task\manager::queue_adhoc_task($task, true);
             $queued++;
         }
@@ -566,7 +667,7 @@ class reconciler {
             return 0;
         }
 
-        $cutoff = time() - ($days * DAYSECS);
+        $cutoff = \core\di::get(\core\clock::class)->time() - ($days * DAYSECS);
         $expired = $DB->get_records_sql(
             "SELECT ue.id, ue.userid, ue.enrolid
                FROM {user_enrolments} ue
@@ -593,10 +694,14 @@ class reconciler {
             $userid = (int) $ue->userid;
             if ((int) $instance->customint2 === instance_manager::KIND_HOST) {
                 // Not every old suspension is unjustified (PR #9 review, F2):
-                // an ENTITLED hidden/none-mode host enrolment is suspended by
+                // an ENTITLED hidden-mode host enrolment is suspended by
                 // design, forever - that record is what keeps the learner
-                // countable in reports. Only purge on an explicit "not
-                // entitled"; null (or an unanswerable question) keeps the row.
+                // countable in reports. Mode "none" is different (decision of
+                // 2026-10-13: suspend first, remove later): it promises no
+                // enrolment at all, so a record left from an earlier mode is
+                // suspended at once and removed after the retention period
+                // like any other. Null (an unanswerable question) keeps the
+                // row.
                 if (!self::host_support_available()) {
                     continue;
                 }
@@ -605,7 +710,10 @@ class reconciler {
                     (int) $instance->courseid,
                     $userid
                 );
-                if ($entitlement === null || !empty($entitlement[0])) {
+                if ($entitlement === null) {
+                    continue;
+                }
+                if (!empty($entitlement[0]) && (string) ($entitlement[1] ?? '') !== self::MODE_NONE) {
                     continue;
                 }
             } else if (
